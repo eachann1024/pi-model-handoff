@@ -1,6 +1,6 @@
 {
   "name": "@each1024/pi-model-handoff",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Switch models mid-session in Pi with a bounded context handoff and on-demand access to conversation history.",
   "type": "module",
   "license": "MIT",
