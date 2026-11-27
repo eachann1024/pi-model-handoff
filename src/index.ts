@@ -9,6 +9,7 @@ import { formatHistoryReadText, readBranchHistory } from "./history-read-tool.ts
 import {
   collectFrozenRecords,
   handoffRecordKey,
+  previewHandoffForLane,
   projectMessagesForLane,
   segmentBranchIntoRuns,
   sliceActiveBranchAfterCompaction,
@@ -17,11 +18,20 @@ import {
   HANDOFF_ENTRY_TYPE,
   STATUS_KEY,
   TOOL_NAME_HISTORY_READ,
+  WIDGET_KEY,
   type ConversationRun,
   type FrozenHandoffRecord,
+  type HandoffPreview,
   type LaneKey,
   type ProjectionResult,
 } from "./types.ts";
+import {
+  createFallbackNoticeWidget,
+  createHandoffEntryRenderer,
+  createPendingHandoffWidget,
+  formatGreenStatusText,
+  formatStatusCommandSummary,
+} from "./ui-feedback.ts";
 
 const HistoryReadParamsSchema = Type.Object({
   entryId: Type.Optional(
@@ -73,24 +83,63 @@ const HistoryReadParamsSchema = Type.Object({
 
 interface BranchLaneState {
   runs: ConversationRun[];
-  frozenRecords: Map<string, FrozenHandoffRecord>;
   targetRecords: FrozenHandoffRecord[];
-  lastDeliveredRun: ConversationRun | null;
-  pendingFromLane: LaneKey | null;
 }
 
-function getTargetLane(model: ExtensionContext["model"]): LaneKey | null {
+interface FeedbackEvalOptions {
+  modelOverride?: ExtensionContext["model"];
+  projection?: ProjectionResult;
+  preview?: HandoffPreview;
+  preferUsage?: boolean;
+}
+
+interface FeedbackSnapshot {
+  targetLane: LaneKey | null;
+  bypass: boolean;
+  tokenCap: number;
+  totalRuns: number;
+  targetRecordCount: number;
+  latestRecord: FrozenHandoffRecord | null;
+  remainingTokens: number | null;
+  contextWindow: number | null;
+  pendingPreview: HandoffPreview | null;
+}
+
+function getTargetLane(model: ExtensionContext["model"] | undefined): LaneKey | null {
   if (!model) {
     return null;
   }
   return laneKeyFromModel(model.provider, model.id);
 }
 
-function formatStrategyTag(record: FrozenHandoffRecord): string {
-  if (record.strategy === "delta_since_target_last_seen") {
-    return "delta";
+function resolveContextWindow(
+  model: ExtensionContext["model"] | undefined,
+  usageWindow?: number,
+  fallbackWindow?: number | null,
+): number | null {
+  const modelWindow = model?.contextWindow;
+  if (
+    typeof modelWindow === "number" &&
+    Number.isFinite(modelWindow) &&
+    modelWindow > 0
+  ) {
+    return Math.floor(modelWindow);
   }
-  return record.fallbackReset ? "reset" : "full";
+  if (
+    typeof usageWindow === "number" &&
+    Number.isFinite(usageWindow) &&
+    usageWindow > 0
+  ) {
+    return Math.floor(usageWindow);
+  }
+  if (
+    typeof fallbackWindow === "number" &&
+    Number.isFinite(fallbackWindow) &&
+    fallbackWindow > 0
+  ) {
+    return Math.floor(fallbackWindow);
+  }
+  return null;
 }
 
 function inspectBranchState(
@@ -112,102 +161,10 @@ function inspectBranchState(
     }
   }
 
-  let lastDeliveredRun: ConversationRun | null = null;
-  for (let i = runs.length - 1; i >= 0; i--) {
-    if (runs[i].delivered && runs[i].ownerLane !== null) {
-      lastDeliveredRun = runs[i];
-      break;
-    }
-  }
-
-  let pendingFromLane: LaneKey | null = null;
-  if (
-    targetLane &&
-    runs.length > 0 &&
-    lastDeliveredRun &&
-    lastDeliveredRun.ownerLane !== null &&
-    lastDeliveredRun.ownerLane !== targetLane
-  ) {
-    const anchorRun = runs[runs.length - 1];
-    const hasAnchorRecord = frozenRecords.has(
-      handoffRecordKey(targetLane, anchorRun.userEntryId),
-    );
-    if (!hasAnchorRecord) {
-      pendingFromLane = lastDeliveredRun.ownerLane;
-    }
-  }
-
   return {
     runs,
-    frozenRecords,
     targetRecords,
-    lastDeliveredRun,
-    pendingFromLane,
   };
-}
-
-function formatStatusLine(
-  targetLane: LaneKey | null,
-  bypass: boolean,
-  state: BranchLaneState,
-  projection?: ProjectionResult,
-): string | undefined {
-  if (!targetLane) {
-    return bypass ? "handoff: bypass" : undefined;
-  }
-  if (bypass) {
-    return `handoff: ${targetLane} [bypass]`;
-  }
-
-  if (projection) {
-    if (projection.appliedRecords.length > 0) {
-      const latest =
-        projection.appliedRecords[projection.appliedRecords.length - 1];
-      return `handoff: ${targetLane} (${formatStrategyTag(latest)}, ${projection.keptNativeRuns}/${projection.totalRuns}r)`;
-    }
-    return projection.totalRuns > 0
-      ? `handoff: ${targetLane} (${projection.totalRuns}r)`
-      : `handoff: ${targetLane}`;
-  }
-
-  if (state.targetRecords.length > 0) {
-    const latest = state.targetRecords[state.targetRecords.length - 1];
-    return `handoff: ${targetLane} (${formatStrategyTag(latest)}, ${state.runs.length}r)`;
-  }
-  if (state.pendingFromLane) {
-    return `handoff: ${targetLane} (switch←${state.pendingFromLane})`;
-  }
-  return state.runs.length > 0
-    ? `handoff: ${targetLane} (${state.runs.length}r)`
-    : `handoff: ${targetLane}`;
-}
-
-function formatCommandSummary(
-  targetLane: LaneKey | null,
-  bypass: boolean,
-  tokenCap: number,
-  state: BranchLaneState,
-): string {
-  const lines: string[] = [
-    `Lane: ${targetLane ?? "(none)"}`,
-    `Mode: ${bypass ? "bypass (off)" : "active (on)"}`,
-    `Token cap: ${tokenCap}`,
-    `Active runs: ${state.runs.length}${state.lastDeliveredRun?.ownerLane ? ` (last delivered: ${state.lastDeliveredRun.ownerLane})` : ""}`,
-    `Frozen records: ${state.targetRecords.length} on lane / ${state.frozenRecords.size} total`,
-  ];
-
-  if (state.targetRecords.length > 0) {
-    const latest = state.targetRecords[state.targetRecords.length - 1];
-    lines.push(
-      `Latest handoff: ${latest.strategy}${latest.fallbackReset ? " [fallback-reset]" : ""} from ${latest.fromLane ?? "none"}, runs ${latest.coveredRunFrom}..${latest.coveredRunTo}, included=${latest.includedCount}, omitted=${latest.omittedCount}, ~${latest.estimatedTokens} tok`,
-    );
-  } else if (state.pendingFromLane) {
-    lines.push(
-      `Pending handoff: next turn will project from ${state.pendingFromLane} to ${targetLane}`,
-    );
-  }
-
-  return lines.join("\n");
 }
 
 /**
@@ -218,25 +175,140 @@ export default function piModelHandoffExtension(pi: ExtensionAPI): void {
   const extraRecords = new Map<string, FrozenHandoffRecord>();
   let bypass = false;
 
-  const refreshStatus = (
+  const clearPendingWidget = (ctx: ExtensionContext): void => {
+    if (ctx.hasUI) {
+      ctx.ui.setWidget(WIDGET_KEY, undefined);
+    }
+  };
+
+  const syncPendingWidget = (
     ctx: ExtensionContext,
-    modelOverride?: ExtensionContext["model"],
-    projection?: ProjectionResult,
+    preview: HandoffPreview | null,
   ): void => {
     if (!ctx.hasUI) {
       return;
     }
-    const targetLane = getTargetLane(modelOverride ?? ctx.model);
-    const state = inspectBranchState(
-      ctx.sessionManager.getBranch(),
-      targetLane,
-      extraRecords,
-    );
-    ctx.ui.setStatus(
-      STATUS_KEY,
-      formatStatusLine(targetLane, bypass, state, projection),
-    );
+    if (!bypass && preview?.willHandoff) {
+      ctx.ui.setWidget(WIDGET_KEY, createPendingHandoffWidget(preview));
+    } else {
+      ctx.ui.setWidget(WIDGET_KEY, undefined);
+    }
   };
+
+  const evaluateFeedbackState = (
+    ctx: ExtensionContext,
+    options?: FeedbackEvalOptions,
+  ): FeedbackSnapshot => {
+    const activeModel = options?.modelOverride ?? ctx.model;
+    const targetLane = getTargetLane(activeModel);
+    const tokenCap = resolveTokenCap();
+    if (!targetLane || !activeModel) {
+      return {
+        targetLane: null,
+        bypass,
+        tokenCap,
+        totalRuns: 0,
+        targetRecordCount: 0,
+        latestRecord: null,
+        remainingTokens: null,
+        contextWindow: null,
+        pendingPreview: null,
+      };
+    }
+
+    const branch = ctx.sessionManager.getBranch();
+    const state = inspectBranchState(branch, targetLane, extraRecords);
+
+    if (options?.projection) {
+      const projection = options.projection;
+      const latestRecord =
+        projection.newRecord ??
+        projection.appliedRecords[projection.appliedRecords.length - 1] ??
+        state.targetRecords[state.targetRecords.length - 1] ??
+        null;
+      return {
+        targetLane,
+        bypass,
+        tokenCap,
+        totalRuns: projection.totalRuns,
+        targetRecordCount: state.targetRecords.length,
+        latestRecord,
+        remainingTokens: projection.remainingContextTokens,
+        contextWindow: projection.contextWindow,
+        pendingPreview: null,
+      };
+    }
+
+    const preview =
+      options?.preview ??
+      previewHandoffForLane({
+        branch,
+        targetLane,
+        modelContextWindow: activeModel.contextWindow,
+        tokenCap,
+        extraRecords,
+        bypass,
+      });
+    const usage = ctx.getContextUsage();
+    const contextWindow = resolveContextWindow(
+      activeModel,
+      usage?.contextWindow,
+      preview.contextWindow,
+    );
+    const rawUsageTokens = usage?.tokens;
+    const hasFiniteUsage =
+      typeof rawUsageTokens === "number" && Number.isFinite(rawUsageTokens);
+
+    const usedTokens =
+      !bypass && preview.willHandoff
+        ? preview.projectedContextTokens
+        : options?.preferUsage && hasFiniteUsage
+          ? rawUsageTokens
+          : preview.projectedContextTokens;
+    const remainingTokens =
+      contextWindow !== null && Number.isFinite(usedTokens)
+        ? Math.max(0, contextWindow - usedTokens)
+        : preview.remainingContextTokens;
+
+    return {
+      targetLane,
+      bypass,
+      tokenCap,
+      totalRuns: state.runs.length,
+      targetRecordCount: state.targetRecords.length,
+      latestRecord:
+        state.targetRecords[state.targetRecords.length - 1] ?? null,
+      remainingTokens,
+      contextWindow,
+      pendingPreview: bypass ? null : preview,
+    };
+  };
+
+  const refreshStatus = (
+    ctx: ExtensionContext,
+    options?: FeedbackEvalOptions,
+  ): FeedbackSnapshot => {
+    const feedback = evaluateFeedbackState(ctx, options);
+    if (ctx.hasUI) {
+      ctx.ui.setStatus(
+        STATUS_KEY,
+        formatGreenStatusText(ctx.ui.theme, {
+          targetLane: feedback.targetLane,
+          bypass: feedback.bypass,
+          remainingTokens: feedback.remainingTokens,
+          contextWindow: feedback.contextWindow,
+          latestRecord: feedback.latestRecord,
+          pendingPreview: feedback.pendingPreview,
+        }),
+      );
+    }
+    return feedback;
+  };
+
+  pi.registerEntryRenderer<FrozenHandoffRecord>(
+    HANDOFF_ENTRY_TYPE,
+    createHandoffEntryRenderer(),
+  );
 
   pi.registerTool({
     name: TOOL_NAME_HISTORY_READ,
@@ -264,6 +336,7 @@ export default function piModelHandoffExtension(pi: ExtensionAPI): void {
   pi.on("context", (event, ctx) => {
     const targetLane = getTargetLane(ctx.model);
     if (!targetLane || !ctx.model) {
+      clearPendingWidget(ctx);
       refreshStatus(ctx);
       return undefined;
     }
@@ -285,16 +358,23 @@ export default function piModelHandoffExtension(pi: ExtensionAPI): void {
       );
       extraRecords.set(key, result.newRecord);
       pi.appendEntry(HANDOFF_ENTRY_TYPE, result.newRecord);
-
+      clearPendingWidget(ctx);
+    } else if (result.fallbackResetNoRecord) {
       if (ctx.hasUI) {
-        ctx.ui.notify(
-          `Handoff → ${result.newRecord.targetLane} (${formatStrategyTag(result.newRecord)}, from ${result.newRecord.fromLane ?? "none"}, ~${result.newRecord.estimatedTokens} tok)`,
-          "info",
+        ctx.ui.setWidget(
+          WIDGET_KEY,
+          createFallbackNoticeWidget(
+            targetLane,
+            result.remainingContextTokens,
+            result.contextWindow,
+          ),
         );
       }
+    } else {
+      clearPendingWidget(ctx);
     }
 
-    refreshStatus(ctx, ctx.model, result);
+    refreshStatus(ctx, { modelOverride: ctx.model, projection: result });
 
     if (result.modified) {
       return { messages: result.messages };
@@ -302,23 +382,53 @@ export default function piModelHandoffExtension(pi: ExtensionAPI): void {
     return undefined;
   });
 
+  pi.on("agent_end", (_event, ctx) => {
+    refreshStatus(ctx, { preferUsage: true });
+  });
+
   pi.on("session_start", (_event, ctx) => {
     extraRecords.clear();
-    refreshStatus(ctx);
+    bypass = false;
+    clearPendingWidget(ctx);
+    refreshStatus(ctx, { preferUsage: true });
   });
 
   pi.on("session_tree", (_event, ctx) => {
     extraRecords.clear();
-    refreshStatus(ctx);
+    clearPendingWidget(ctx);
+    refreshStatus(ctx, { preferUsage: true });
   });
 
   pi.on("session_compact", (_event, ctx) => {
     extraRecords.clear();
-    refreshStatus(ctx);
+    clearPendingWidget(ctx);
+    refreshStatus(ctx, { preferUsage: true });
   });
 
   pi.on("model_select", (event, ctx) => {
-    refreshStatus(ctx, event.model);
+    const previousLane = getTargetLane(event.previousModel);
+    const nextLane = getTargetLane(event.model);
+    if (previousLane === nextLane) {
+      refreshStatus(ctx, { modelOverride: event.model, preferUsage: true });
+      return;
+    }
+
+    if (bypass || !nextLane) {
+      clearPendingWidget(ctx);
+      refreshStatus(ctx, { modelOverride: event.model });
+      return;
+    }
+
+    const preview = previewHandoffForLane({
+      branch: ctx.sessionManager.getBranch(),
+      targetLane: nextLane,
+      modelContextWindow: event.model.contextWindow,
+      tokenCap: resolveTokenCap(),
+      extraRecords,
+      bypass,
+    });
+    syncPendingWidget(ctx, preview);
+    refreshStatus(ctx, { modelOverride: event.model, preview });
   });
 
   pi.registerCommand("handoff-status", {
@@ -338,55 +448,46 @@ export default function piModelHandoffExtension(pi: ExtensionAPI): void {
       const arg = args.trim().toLowerCase();
       if (arg === "on" || arg === "bypass off") {
         bypass = false;
-        refreshStatus(ctx);
+        const feedback = refreshStatus(ctx, { preferUsage: true });
+        syncPendingWidget(ctx, feedback.pendingPreview);
         if (ctx.hasUI) {
-          ctx.ui.notify("Model handoff enabled (bypass=off).", "info");
+          ctx.ui.notify("模型交接已启用（bypass=off）。", "info");
         }
         return;
       }
       if (arg === "off" || arg === "bypass on") {
         bypass = true;
-        refreshStatus(ctx);
+        clearPendingWidget(ctx);
+        refreshStatus(ctx, { preferUsage: true });
         if (ctx.hasUI) {
-          ctx.ui.notify("Model handoff bypassed (bypass=on).", "warning");
+          ctx.ui.notify("模型交接已暂停（直通模式，bypass=on）。", "info");
         }
         return;
       }
       if (arg === "bypass" || arg === "toggle") {
         bypass = !bypass;
-        refreshStatus(ctx);
+        const feedback = refreshStatus(ctx, { preferUsage: true });
+        syncPendingWidget(ctx, feedback.pendingPreview);
         if (ctx.hasUI) {
           ctx.ui.notify(
             bypass
-              ? "Model handoff bypassed (bypass=on)."
-              : "Model handoff enabled (bypass=off).",
-            bypass ? "warning" : "info",
+              ? "模型交接已暂停（直通模式，bypass=on）。"
+              : "模型交接已启用（bypass=off）。",
+            "info",
           );
         }
         return;
       }
       if (arg.length > 0 && arg !== "status") {
         if (ctx.hasUI) {
-          ctx.ui.notify(
-            "Usage: /handoff-status [on|off|bypass]",
-            "warning",
-          );
+          ctx.ui.notify("用法: /handoff-status [on|off|bypass]", "info");
         }
         return;
       }
 
-      const targetLane = getTargetLane(ctx.model);
-      const state = inspectBranchState(
-        ctx.sessionManager.getBranch(),
-        targetLane,
-        extraRecords,
-      );
-      refreshStatus(ctx);
+      const feedback = refreshStatus(ctx, { preferUsage: true });
       if (ctx.hasUI) {
-        ctx.ui.notify(
-          formatCommandSummary(targetLane, bypass, resolveTokenCap(), state),
-          "info",
-        );
+        ctx.ui.notify(formatStatusCommandSummary(feedback), "info");
       }
     },
   });

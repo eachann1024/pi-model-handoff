@@ -24,6 +24,8 @@ import {
   MIN_DELTA_BUDGET_BYTES,
   type ConversationRun,
   type FrozenHandoffRecord,
+  type HandoffPreview,
+  type HandoffPreviewInput,
   type HandoffStrategy,
   type LaneKey,
   type ProjectMessagesInput,
@@ -122,8 +124,9 @@ function extractUsageInputTokens(msg: AssistantMessage): number | undefined {
 
 /**
  * Segment active branch entries into user-turn runs. Each run's `ownerLane` is
- * determined by its last valid assistant message; `error`/`aborted` empty runs
- * are not counted as delivered, and the current unfinished run belongs to `currentLane`.
+ * determined by its last assistant message; `error`/`aborted` runs are marked
+ * `delivered=false, hasError=true` with their model lane preserved, and the
+ * current unfinished run without an assistant response belongs to `currentLane`.
  */
 export function segmentBranchIntoRuns(
   activeEntries: SessionEntry[],
@@ -147,8 +150,8 @@ export function segmentBranchIntoRuns(
     const entries = activeEntries.slice(startIndex, endIndex + 1);
     const userEntry = activeEntries[startIndex] as SessionMessageEntry;
 
-    let lastValidAssistant: AssistantMessage | null = null;
-    let hasError = false;
+    let lastAssistant: AssistantMessage | null = null;
+    let lastAssistantWithModel: AssistantMessage | null = null;
 
     for (const entry of entries) {
       if (entry.type !== "message" || entry.message?.role !== "assistant") {
@@ -158,30 +161,54 @@ export function segmentBranchIntoRuns(
         continue;
       }
       const assistant = entry.message as AssistantMessage;
-      if (
-        assistant.stopReason === "error" ||
-        assistant.stopReason === "aborted"
-      ) {
-        hasError = true;
-      }
-      if (isValidAssistantMessage(assistant)) {
-        lastValidAssistant = assistant;
+      lastAssistant = assistant;
+      if (assistant.provider && assistant.model) {
+        lastAssistantWithModel = assistant;
       }
     }
 
     const isLastRun = r === userIndices.length - 1;
     let ownerLane: LaneKey | null = null;
     let delivered = false;
+    let hasError = false;
     let lastUsageInputTokens: number | undefined;
 
-    if (lastValidAssistant) {
-      ownerLane =
-        lastValidAssistant.provider && lastValidAssistant.model
-          ? laneKeyFromModel(lastValidAssistant.provider, lastValidAssistant.model)
-          : currentLane;
-      delivered = true;
-      lastUsageInputTokens = extractUsageInputTokens(lastValidAssistant);
-    } else if (isLastRun && !hasError) {
+    if (lastAssistant) {
+      if (
+        lastAssistant.stopReason === "error" ||
+        lastAssistant.stopReason === "aborted"
+      ) {
+        delivered = false;
+        hasError = true;
+        const laneSource =
+          lastAssistant.provider && lastAssistant.model
+            ? lastAssistant
+            : lastAssistantWithModel;
+        ownerLane =
+          laneSource && laneSource.provider && laneSource.model
+            ? laneKeyFromModel(laneSource.provider, laneSource.model)
+            : null;
+      } else if (isValidAssistantMessage(lastAssistant)) {
+        ownerLane =
+          lastAssistant.provider && lastAssistant.model
+            ? laneKeyFromModel(lastAssistant.provider, lastAssistant.model)
+            : currentLane;
+        delivered = true;
+        lastUsageInputTokens = extractUsageInputTokens(lastAssistant);
+      } else {
+        delivered = false;
+        hasError = false;
+        const laneSource =
+          lastAssistant.provider && lastAssistant.model
+            ? lastAssistant
+            : lastAssistantWithModel;
+        ownerLane = isLastRun
+          ? currentLane
+          : laneSource && laneSource.provider && laneSource.model
+            ? laneKeyFromModel(laneSource.provider, laneSource.model)
+            : null;
+      }
+    } else if (isLastRun) {
       ownerLane = currentLane;
       delivered = false;
     }
@@ -359,15 +386,185 @@ function estimateAgentMessageTokens(msg: AgentMessage): number {
 
 function buildItemsWithOptionalPreRun(
   activeEntries: SessionEntry[],
+  firstRunStart: number,
   targetRuns: ConversationRun[],
   includePreRun: boolean,
 ) {
   if (!includePreRun) {
     return extractHistoricalItems(targetRuns);
   }
-  const firstRunStart = targetRuns[0]?.startIndex ?? activeEntries.length;
   const preRunEntries = activeEntries.slice(0, firstRunStart);
   return extractHistoricalItems(targetRuns, preRunEntries);
+}
+
+function normalizeContextWindow(modelContextWindow?: number): number | null {
+  if (
+    modelContextWindow !== undefined &&
+    Number.isFinite(modelContextWindow) &&
+    modelContextWindow > 0
+  ) {
+    return Math.floor(modelContextWindow);
+  }
+  return null;
+}
+
+function estimateMessagesTokens(messages: readonly AgentMessage[]): number {
+  let total = 0;
+  for (const msg of messages) {
+    total += estimateAgentMessageTokens(msg);
+  }
+  return total;
+}
+
+function estimateSessionEntryTokens(
+  entry: SessionEntry,
+  editsByTarget: ReadonlyMap<string, ContextEditEntry>,
+): number {
+  if (!entry || typeof entry !== "object") {
+    return 0;
+  }
+  const edit = editsByTarget.get(entry.id);
+  if (edit?.replacement === null) {
+    return 0;
+  }
+  if (entry.type === "message") {
+    const baseMsg = entry.message as AgentMessage;
+    if (edit?.replacement) {
+      const replacement = edit.replacement as {
+        content?: unknown;
+      };
+      if (
+        replacement.content !== undefined &&
+        (baseMsg.role === "user" ||
+          baseMsg.role === "assistant" ||
+          baseMsg.role === "toolResult" ||
+          baseMsg.role === "custom")
+      ) {
+        return estimateContentBlocksTokens(
+          replacement.content as UserMessage["content"],
+        );
+      }
+    }
+    return estimateAgentMessageTokens(baseMsg);
+  }
+  if (entry.type === "custom_message") {
+    if (entry.customType === HANDOFF_ENTRY_TYPE) {
+      return 0;
+    }
+    return estimateContentBlocksTokens(
+      entry.content as UserMessage["content"],
+    );
+  }
+  if (entry.type === "compaction" || entry.type === "branch_summary") {
+    return typeof entry.summary === "string"
+      ? estimateTextTokens(entry.summary)
+      : 0;
+  }
+  return 0;
+}
+
+function runHasConversationOrToolActivity(
+  run: ConversationRun,
+  editsByTarget: ReadonlyMap<string, ContextEditEntry>,
+): boolean {
+  if (run.delivered || run.hasError) {
+    return true;
+  }
+  for (const entry of run.entries) {
+    if (entry.type !== "message") {
+      continue;
+    }
+    if (editsByTarget.get(entry.id)?.replacement === null) {
+      continue;
+    }
+    const msg = entry.message;
+    if (!msg) {
+      continue;
+    }
+    if (msg.role === "assistant" || msg.role === "toolResult") {
+      return true;
+    }
+    if (msg.role === "bashExecution" && !msg.excludeFromContext) {
+      return true;
+    }
+  }
+  return false;
+}
+
+interface PreRunContextInfo {
+  entries: SessionEntry[];
+  hasContext: boolean;
+  ownerLane: LaneKey | null;
+}
+
+function inspectPreRunContext(
+  activeEntries: SessionEntry[],
+  firstRunStart: number,
+  editsByTarget: ReadonlyMap<string, ContextEditEntry>,
+): PreRunContextInfo {
+  const entries = activeEntries.slice(0, firstRunStart);
+  let hasContext = false;
+  let lastAssistant: AssistantMessage | null = null;
+  let lastAssistantWithModel: AssistantMessage | null = null;
+
+  for (const entry of entries) {
+    if (!entry || typeof entry !== "object") {
+      continue;
+    }
+    if (entry.type === "compaction" || entry.type === "branch_summary") {
+      if (typeof entry.summary === "string" && entry.summary.trim().length > 0) {
+        hasContext = true;
+      }
+      continue;
+    }
+    if (entry.type === "custom_message") {
+      if (entry.customType !== HANDOFF_ENTRY_TYPE) {
+        hasContext = true;
+      }
+      continue;
+    }
+    if (entry.type !== "message") {
+      continue;
+    }
+    if (editsByTarget.get(entry.id)?.replacement === null) {
+      continue;
+    }
+    const msg = entry.message;
+    if (!msg) {
+      continue;
+    }
+    if (msg.role === "assistant") {
+      hasContext = true;
+      const assistant = msg as AssistantMessage;
+      lastAssistant = assistant;
+      if (assistant.provider && assistant.model) {
+        lastAssistantWithModel = assistant;
+      }
+    } else if (
+      msg.role === "toolResult" ||
+      msg.role === "compactionSummary" ||
+      msg.role === "branchSummary" ||
+      (msg.role === "bashExecution" && !msg.excludeFromContext) ||
+      (msg.role === "custom" && msg.customType !== HANDOFF_ENTRY_TYPE)
+    ) {
+      hasContext = true;
+    }
+  }
+
+  let ownerLane: LaneKey | null = null;
+  const laneSource =
+    lastAssistant && lastAssistant.provider && lastAssistant.model
+      ? lastAssistant
+      : lastAssistantWithModel;
+  if (laneSource && laneSource.provider && laneSource.model) {
+    ownerLane = laneKeyFromModel(laneSource.provider, laneSource.model);
+  }
+
+  return {
+    entries,
+    hasContext,
+    ownerLane,
+  };
 }
 
 interface AlignedMessageSlice {
@@ -620,55 +817,112 @@ function dropOrphanedToolResults(
   return { messages: result, dropped };
 }
 
-function computeKeepSetAndEffectiveRecords(
-  runs: ConversationRun[],
-  anchorRun: ConversationRun,
-  targetLane: LaneKey,
-  frozenRecords: ReadonlyMap<string, FrozenHandoffRecord>,
-): {
+interface KeepSetPlan {
   effectiveStartOrdinal: number;
+  omitPreRunMessages: boolean;
   omittedOrdinals: Set<number>;
   recordByRunOrdinal: Map<number, FrozenHandoffRecord>;
-} {
+}
+
+function computeKeepSetAndEffectiveRecords(params: {
+  runs: ConversationRun[];
+  anchorOrdinal: number;
+  anchorUserEntryId: string;
+  targetLane: LaneKey;
+  frozenRecords: ReadonlyMap<string, FrozenHandoffRecord>;
+  fallbackResetNoRecord?: boolean;
+}): KeepSetPlan {
+  const {
+    runs,
+    anchorOrdinal,
+    anchorUserEntryId,
+    targetLane,
+    frozenRecords,
+    fallbackResetNoRecord = false,
+  } = params;
   const recordByRunOrdinal = new Map<number, FrozenHandoffRecord>();
-  let effectiveStartOrdinal = 1;
-  let fallbackResetOrdinal = 1;
-
-  for (const run of runs) {
-    const rec = frozenRecords.get(handoffRecordKey(targetLane, run.userEntryId));
-    if (!rec) continue;
-    recordByRunOrdinal.set(run.ordinal, rec);
-    if (run.ordinal <= anchorRun.ordinal) {
-      if (rec.strategy === "full_thread_summary" || rec.fallbackReset) {
-        effectiveStartOrdinal = Math.max(effectiveStartOrdinal, run.ordinal);
-      }
-      if (rec.fallbackReset) {
-        fallbackResetOrdinal = Math.max(fallbackResetOrdinal, run.ordinal);
-      }
-    }
-  }
-
   const omittedOrdinals = new Set<number>();
-  // Any ordinal-based filtering is strictly bounded before anchorRun.ordinal;
-  // do not use stale pre-compaction coveredRunFrom..coveredRunTo ranges.
+
+  if (fallbackResetNoRecord) {
+    for (const run of runs) {
+      if (run.ordinal < anchorOrdinal) {
+        omittedOrdinals.add(run.ordinal);
+      }
+    }
+    return {
+      effectiveStartOrdinal: anchorOrdinal,
+      omitPreRunMessages: true,
+      omittedOrdinals,
+      recordByRunOrdinal,
+    };
+  }
+
+  let effectiveStartOrdinal = 1;
+  let omitPreRunMessages = false;
+
+  const applyRecordCoverage = (
+    recOrdinal: number,
+    rec: FrozenHandoffRecord,
+  ): void => {
+    recordByRunOrdinal.set(recOrdinal, rec);
+    if (rec.strategy === "full_thread_summary" || rec.fallbackReset) {
+      effectiveStartOrdinal = Math.max(effectiveStartOrdinal, recOrdinal);
+      omitPreRunMessages = true;
+      for (const prior of runs) {
+        if (prior.ordinal < recOrdinal) {
+          omittedOrdinals.add(prior.ordinal);
+        }
+      }
+      return;
+    }
+
+    // Delta record covers all runs strictly between the last delivered run on
+    // targetLane before recOrdinal and recOrdinal itself (regardless of delivered).
+    let lastTargetOrdinal = 0;
+    for (let i = runs.length - 1; i >= 0; i--) {
+      const candidate = runs[i];
+      if (
+        candidate.ordinal < recOrdinal &&
+        candidate.delivered &&
+        candidate.ownerLane === targetLane
+      ) {
+        lastTargetOrdinal = candidate.ordinal;
+        break;
+      }
+    }
+    for (const prior of runs) {
+      if (prior.ordinal > lastTargetOrdinal && prior.ordinal < recOrdinal) {
+        omittedOrdinals.add(prior.ordinal);
+      }
+    }
+  };
+
   for (const run of runs) {
-    if (run.ordinal >= anchorRun.ordinal) {
+    if (run.ordinal > anchorOrdinal) {
       continue;
     }
-    if (run.ordinal < fallbackResetOrdinal) {
-      omittedOrdinals.add(run.ordinal);
-      continue;
-    }
-    if (
-      run.delivered &&
-      run.ownerLane !== null &&
-      run.ownerLane !== targetLane
-    ) {
-      omittedOrdinals.add(run.ordinal);
+    const rec = frozenRecords.get(handoffRecordKey(targetLane, run.userEntryId));
+    if (rec) {
+      applyRecordCoverage(run.ordinal, rec);
     }
   }
 
-  return { effectiveStartOrdinal, omittedOrdinals, recordByRunOrdinal };
+  // Handle a synthetic preview anchor not present in `runs`.
+  if (!runs.some((run) => run.ordinal === anchorOrdinal)) {
+    const anchorRec = frozenRecords.get(
+      handoffRecordKey(targetLane, anchorUserEntryId),
+    );
+    if (anchorRec) {
+      applyRecordCoverage(anchorOrdinal, anchorRec);
+    }
+  }
+
+  return {
+    effectiveStartOrdinal,
+    omitPreRunMessages,
+    omittedOrdinals,
+    recordByRunOrdinal,
+  };
 }
 
 function estimateNativePrefixTokens(
@@ -679,7 +933,7 @@ function estimateNativePrefixTokens(
   omittedOrdinals: Set<number>,
   recordByRunOrdinal: Map<number, FrozenHandoffRecord>,
   upToOrdinal: number,
-  effectiveStartOrdinal: number,
+  omitPreRunMessages: boolean,
 ): number {
   const keptPrefixRuns = runs.filter(
     (run) => run.ordinal <= upToOrdinal && !omittedOrdinals.has(run.ordinal),
@@ -706,7 +960,7 @@ function estimateNativePrefixTokens(
   if (lastUsageIdx >= 0) {
     total = keptPrefixRuns[lastUsageIdx].lastUsageInputTokens!;
     estimateFromIdx = lastUsageIdx + 1;
-  } else if (effectiveStartOrdinal === 1) {
+  } else if (!omitPreRunMessages) {
     for (const msg of preRunMessages) {
       total += estimateAgentMessageTokens(msg);
     }
@@ -730,8 +984,61 @@ function estimateNativePrefixTokens(
   return total;
 }
 
+function estimateNativePrefixTokensFromBranch(
+  runs: ConversationRun[],
+  preRunEntries: SessionEntry[],
+  editsByTarget: ReadonlyMap<string, ContextEditEntry>,
+  omittedOrdinals: Set<number>,
+  recordByRunOrdinal: Map<number, FrozenHandoffRecord>,
+  upToOrdinal: number,
+  omitPreRunMessages: boolean,
+): number {
+  const keptPrefixRuns = runs.filter(
+    (run) => run.ordinal <= upToOrdinal && !omittedOrdinals.has(run.ordinal),
+  );
+  if (keptPrefixRuns.length === 0) {
+    return 0;
+  }
+
+  let lastUsageIdx = -1;
+  for (let i = keptPrefixRuns.length - 1; i >= 0; i--) {
+    if (
+      keptPrefixRuns[i].lastUsageInputTokens !== undefined &&
+      keptPrefixRuns[i].lastUsageInputTokens! > 0
+    ) {
+      lastUsageIdx = i;
+      break;
+    }
+  }
+
+  let total = 0;
+  let estimateFromIdx = 0;
+  if (lastUsageIdx >= 0) {
+    total = keptPrefixRuns[lastUsageIdx].lastUsageInputTokens!;
+    estimateFromIdx = lastUsageIdx + 1;
+  } else if (!omitPreRunMessages) {
+    for (const entry of preRunEntries) {
+      total += estimateSessionEntryTokens(entry, editsByTarget);
+    }
+  }
+
+  for (let i = estimateFromIdx; i < keptPrefixRuns.length; i++) {
+    const run = keptPrefixRuns[i];
+    for (const entry of run.entries) {
+      total += estimateSessionEntryTokens(entry, editsByTarget);
+    }
+    const rec = recordByRunOrdinal.get(run.ordinal);
+    if (rec) {
+      total += estimateTextTokens(rec.renderedText);
+    }
+  }
+
+  return total;
+}
+
 function createHandoffRecord(params: {
   activeEntries: SessionEntry[];
+  firstRunStart: number;
   coveredRuns: ConversationRun[];
   strategy: HandoffStrategy;
   fallbackReset: boolean;
@@ -740,14 +1047,18 @@ function createHandoffRecord(params: {
   anchorUserEntryId: string;
   budgetBytes: number;
   includeCompaction: boolean;
-}): FrozenHandoffRecord | null {
+}): { record: FrozenHandoffRecord | null; exhaustedBudget: boolean } {
   const items = buildItemsWithOptionalPreRun(
     params.activeEntries,
+    params.firstRunStart,
     params.coveredRuns,
     params.includeCompaction,
   );
   if (items.length === 0) {
-    return null;
+    return { record: null, exhaustedBudget: false };
+  }
+  if (params.budgetBytes <= 0) {
+    return { record: null, exhaustedBudget: true };
   }
 
   const coveredRunFrom = params.coveredRuns[0]?.ordinal ?? 0;
@@ -765,24 +1076,225 @@ function createHandoffRecord(params: {
     fallbackReset: params.fallbackReset,
   });
 
+  if (selection.renderedText.length === 0 || selection.byteLength === 0) {
+    return { record: null, exhaustedBudget: true };
+  }
+
   return {
-    version: 1,
-    targetLane: params.targetLane,
-    fromLane: params.fromLane,
-    anchorUserEntryId: params.anchorUserEntryId,
-    strategy: params.strategy,
-    fallbackReset: params.fallbackReset,
-    coveredRunFrom,
-    coveredRunTo,
-    sourceEntryFrom: items[0]?.entryId ?? null,
-    sourceEntryTo: items[items.length - 1]?.entryId ?? null,
-    includedCount: selection.selected.length,
-    omittedCount: selection.omittedCount,
-    omittedEntryIds: selection.omittedEntryIds,
-    estimatedTokens: selection.estimatedTokens,
-    byteLength: selection.byteLength,
-    renderedText: selection.renderedText,
-    createdAt: Date.now(),
+    record: {
+      version: 1,
+      targetLane: params.targetLane,
+      fromLane: params.fromLane,
+      anchorUserEntryId: params.anchorUserEntryId,
+      strategy: params.strategy,
+      fallbackReset: params.fallbackReset,
+      coveredRunFrom,
+      coveredRunTo,
+      sourceEntryFrom: items[0]?.entryId ?? null,
+      sourceEntryTo: items[items.length - 1]?.entryId ?? null,
+      includedCount: selection.selected.length,
+      omittedCount: selection.omittedCount,
+      omittedEntryIds: selection.omittedEntryIds,
+      estimatedTokens: selection.estimatedTokens,
+      byteLength: selection.byteLength,
+      renderedText: selection.renderedText,
+      createdAt: Date.now(),
+    },
+    exhaustedBudget: false,
+  };
+}
+
+interface HandoffPlanOutput {
+  newRecord: FrozenHandoffRecord | null;
+  fallbackResetNoRecord: boolean;
+  attemptedFromLane: LaneKey | null;
+  plan: KeepSetPlan;
+}
+
+function planLaneHandoff(params: {
+  activeEntries: SessionEntry[];
+  firstRunStart: number;
+  runs: ConversationRun[];
+  priorRuns: ConversationRun[];
+  editsByTarget: ReadonlyMap<string, ContextEditEntry>;
+  preRunInfo: PreRunContextInfo;
+  targetLane: LaneKey;
+  modelContextWindow?: number;
+  tokenCap: number;
+  frozenRecords: ReadonlyMap<string, FrozenHandoffRecord>;
+  anchorOrdinal: number;
+  anchorUserEntryId: string;
+  anchorSummary: {
+    text: string;
+    imageCount: number;
+    otherAttachmentCount: number;
+  };
+  estimatePrefixTokens: (
+    prefixPlan: KeepSetPlan,
+    upToOrdinal: number,
+  ) => number;
+}): HandoffPlanOutput {
+  const {
+    activeEntries,
+    firstRunStart,
+    runs,
+    priorRuns,
+    editsByTarget,
+    preRunInfo,
+    targetLane,
+    modelContextWindow,
+    tokenCap,
+    frozenRecords,
+    anchorOrdinal,
+    anchorUserEntryId,
+    anchorSummary,
+    estimatePrefixTokens,
+  } = params;
+
+  const workingFrozenRecords = new Map(frozenRecords);
+  const anchorKey = handoffRecordKey(targetLane, anchorUserEntryId);
+  let newRecord: FrozenHandoffRecord | null = null;
+  let fallbackResetNoRecord = false;
+  let attemptedFromLane: LaneKey | null = null;
+
+  if (!workingFrozenRecords.has(anchorKey)) {
+    let lastPriorLaneRun: ConversationRun | null = null;
+    for (let i = priorRuns.length - 1; i >= 0; i--) {
+      const candidate = priorRuns[i];
+      if (
+        candidate.ownerLane !== null &&
+        runHasConversationOrToolActivity(candidate, editsByTarget)
+      ) {
+        lastPriorLaneRun = candidate;
+        break;
+      }
+    }
+
+    const fromLane =
+      lastPriorLaneRun?.ownerLane ??
+      (preRunInfo.hasContext ? preRunInfo.ownerLane : null);
+
+    if (fromLane !== null && fromLane !== targetLane) {
+      attemptedFromLane = fromLane;
+      let lastTargetIdx = -1;
+      for (let i = priorRuns.length - 1; i >= 0; i--) {
+        if (
+          priorRuns[i].delivered &&
+          priorRuns[i].ownerLane === targetLane
+        ) {
+          lastTargetIdx = i;
+          break;
+        }
+      }
+
+      if (lastTargetIdx >= 0) {
+        const lastTargetRun = priorRuns[lastTargetIdx];
+        const deltaRuns = priorRuns.slice(lastTargetIdx + 1);
+        const prefixPlan = computeKeepSetAndEffectiveRecords({
+          runs,
+          anchorOrdinal,
+          anchorUserEntryId,
+          targetLane,
+          frozenRecords: workingFrozenRecords,
+        });
+        const nativeTokens = estimatePrefixTokens(
+          prefixPlan,
+          lastTargetRun.ordinal,
+        );
+
+        const deltaBudget = computeHandoffBudget({
+          tokenCap,
+          modelContextWindow,
+          nativeTokens,
+          currentUserText: anchorSummary.text,
+          currentImageCount: anchorSummary.imageCount,
+          currentOtherAttachmentCount: anchorSummary.otherAttachmentCount,
+        });
+
+        if (deltaBudget.budgetBytes < MIN_DELTA_BUDGET_BYTES) {
+          const fullBudget = computeHandoffBudget({
+            tokenCap,
+            modelContextWindow,
+            nativeTokens: 0,
+            currentUserText: anchorSummary.text,
+            currentImageCount: anchorSummary.imageCount,
+            currentOtherAttachmentCount: anchorSummary.otherAttachmentCount,
+          });
+          const created = createHandoffRecord({
+            activeEntries,
+            firstRunStart,
+            coveredRuns: priorRuns,
+            strategy: "full_thread_summary",
+            fallbackReset: true,
+            targetLane,
+            fromLane,
+            anchorUserEntryId,
+            budgetBytes: fullBudget.budgetBytes,
+            includeCompaction: true,
+          });
+          newRecord = created.record;
+          fallbackResetNoRecord = created.exhaustedBudget;
+        } else {
+          const created = createHandoffRecord({
+            activeEntries,
+            firstRunStart,
+            coveredRuns: deltaRuns,
+            strategy: "delta_since_target_last_seen",
+            fallbackReset: false,
+            targetLane,
+            fromLane,
+            anchorUserEntryId,
+            budgetBytes: deltaBudget.budgetBytes,
+            includeCompaction: false,
+          });
+          newRecord = created.record;
+          fallbackResetNoRecord = created.exhaustedBudget;
+        }
+      } else {
+        const fullBudget = computeHandoffBudget({
+          tokenCap,
+          modelContextWindow,
+          nativeTokens: 0,
+          currentUserText: anchorSummary.text,
+          currentImageCount: anchorSummary.imageCount,
+          currentOtherAttachmentCount: anchorSummary.otherAttachmentCount,
+        });
+        const created = createHandoffRecord({
+          activeEntries,
+          firstRunStart,
+          coveredRuns: priorRuns,
+          strategy: "full_thread_summary",
+          fallbackReset: false,
+          targetLane,
+          fromLane,
+          anchorUserEntryId,
+          budgetBytes: fullBudget.budgetBytes,
+          includeCompaction: true,
+        });
+        newRecord = created.record;
+        fallbackResetNoRecord = created.exhaustedBudget;
+      }
+
+      if (newRecord) {
+        workingFrozenRecords.set(anchorKey, newRecord);
+      }
+    }
+  }
+
+  const plan = computeKeepSetAndEffectiveRecords({
+    runs,
+    anchorOrdinal,
+    anchorUserEntryId,
+    targetLane,
+    frozenRecords: workingFrozenRecords,
+    fallbackResetNoRecord,
+  });
+
+  return {
+    newRecord,
+    fallbackResetNoRecord,
+    attemptedFromLane,
+    plan,
   };
 }
 
@@ -797,8 +1309,14 @@ export function projectMessagesForLane(
   const activeEntries = sliceActiveBranchAfterCompaction(input.branch);
   const runs = segmentBranchIntoRuns(activeEntries, input.targetLane);
   const totalRuns = runs.length;
+  const contextWindow = normalizeContextWindow(input.modelContextWindow);
 
-  if (input.bypass || totalRuns === 0) {
+  const buildPassThroughResult = (): ProjectionResult => {
+    const projectedContextTokens = estimateMessagesTokens(input.eventMessages);
+    const remainingContextTokens =
+      contextWindow !== null
+        ? Math.max(0, contextWindow - projectedContextTokens)
+        : null;
     return {
       messages: input.eventMessages,
       modified: false,
@@ -807,38 +1325,53 @@ export function projectMessagesForLane(
       appliedRecords: [],
       keptNativeRuns: totalRuns,
       totalRuns,
+      projectedContextTokens,
+      contextWindow,
+      remainingContextTokens,
     };
+  };
+
+  if (input.bypass || totalRuns === 0) {
+    return buildPassThroughResult();
   }
 
+  const editsByTarget = collectContextEditsByTarget(activeEntries);
+  const firstRunStart = runs[0]?.startIndex ?? activeEntries.length;
+  const preRunInfo = inspectPreRunContext(
+    activeEntries,
+    firstRunStart,
+    editsByTarget,
+  );
   const frozenRecords = collectFrozenRecords(activeEntries, input.extraRecords);
   const anchorRun = runs[runs.length - 1];
   const priorRuns = runs.slice(0, runs.length - 1);
 
-  const hasForeignDelivered = priorRuns.some(
+  const hasForeignInPreRun =
+    preRunInfo.hasContext &&
+    preRunInfo.ownerLane !== null &&
+    preRunInfo.ownerLane !== input.targetLane;
+  const hasForeignInPrior = priorRuns.some(
     (run) =>
-      run.delivered &&
+      runHasConversationOrToolActivity(run, editsByTarget) &&
       run.ownerLane !== null &&
       run.ownerLane !== input.targetLane,
   );
   const hasForeignInAnchor =
-    anchorRun.delivered &&
+    runHasConversationOrToolActivity(anchorRun, editsByTarget) &&
     anchorRun.ownerLane !== null &&
     anchorRun.ownerLane !== input.targetLane;
   const hasFrozenForTarget = runs.some((run) =>
     frozenRecords.has(handoffRecordKey(input.targetLane, run.userEntryId)),
   );
 
-  // Rule 4: Single-lane thread with no foreign history and no frozen records passes through unchanged.
-  if (!hasForeignDelivered && !hasForeignInAnchor && !hasFrozenForTarget) {
-    return {
-      messages: input.eventMessages,
-      modified: false,
-      activeLane: input.targetLane,
-      newRecord: null,
-      appliedRecords: [],
-      keptNativeRuns: totalRuns,
-      totalRuns,
-    };
+  // Rule 4: Single-lane thread with no foreign activity and no frozen records passes through unchanged.
+  if (
+    !hasForeignInPreRun &&
+    !hasForeignInPrior &&
+    !hasForeignInAnchor &&
+    !hasFrozenForTarget
+  ) {
+    return buildPassThroughResult();
   }
 
   const aligned = alignEventMessagesToRuns(
@@ -846,148 +1379,50 @@ export function projectMessagesForLane(
     activeEntries,
     runs,
   );
+  const anchorSliceIdx = aligned.runIndexByOrdinal.get(anchorRun.ordinal);
+  const anchorUserMsg =
+    anchorSliceIdx !== undefined
+      ? (aligned.slices[anchorSliceIdx].messages[0] as UserMessage)
+      : (
+          activeEntries[anchorRun.startIndex] as SessionMessageEntry & {
+            message: UserMessage;
+          }
+        ).message;
+  const anchorSummary = extractUserContentSummary(anchorUserMsg?.content);
 
-  const workingFrozenRecords = new Map(frozenRecords);
-  const anchorKey = handoffRecordKey(input.targetLane, anchorRun.userEntryId);
-  let newRecord: FrozenHandoffRecord | null = null;
-
-  // Rule 3 & 5: Reuse existing frozen record for (targetLane, anchorUserEntryId);
-  // otherwise create one only when switching from a foreign delivered run.
-  if (!workingFrozenRecords.has(anchorKey)) {
-    let lastDeliveredRun: ConversationRun | null = null;
-    for (let i = priorRuns.length - 1; i >= 0; i--) {
-      if (priorRuns[i].delivered && priorRuns[i].ownerLane !== null) {
-        lastDeliveredRun = priorRuns[i];
-        break;
-      }
-    }
-
-    if (lastDeliveredRun && lastDeliveredRun.ownerLane !== input.targetLane) {
-      let lastTargetIdx = -1;
-      for (let i = priorRuns.length - 1; i >= 0; i--) {
-        if (
-          priorRuns[i].delivered &&
-          priorRuns[i].ownerLane === input.targetLane
-        ) {
-          lastTargetIdx = i;
-          break;
-        }
-      }
-
-      const anchorSliceIdx = aligned.runIndexByOrdinal.get(anchorRun.ordinal);
-      const anchorUserMsg =
-        anchorSliceIdx !== undefined
-          ? (aligned.slices[anchorSliceIdx].messages[0] as UserMessage)
-          : (
-              activeEntries[anchorRun.startIndex] as SessionMessageEntry & {
-                message: UserMessage;
-              }
-            ).message;
-      const anchorSummary = extractUserContentSummary(anchorUserMsg?.content);
-
-      if (lastTargetIdx >= 0) {
-        const lastTargetRun = priorRuns[lastTargetIdx];
-        const deltaRuns = priorRuns.slice(lastTargetIdx + 1);
-        const prefixPlan = computeKeepSetAndEffectiveRecords(
-          runs,
-          anchorRun,
-          input.targetLane,
-          workingFrozenRecords,
-        );
-        const nativeTokens = estimateNativePrefixTokens(
-          runs,
-          aligned.preRunMessages,
-          aligned.slices,
-          aligned.runIndexByOrdinal,
-          prefixPlan.omittedOrdinals,
-          prefixPlan.recordByRunOrdinal,
-          lastTargetRun.ordinal,
-          prefixPlan.effectiveStartOrdinal,
-        );
-
-        const deltaBudget = computeHandoffBudget({
-          tokenCap: input.tokenCap,
-          modelContextWindow: input.modelContextWindow,
-          nativeTokens,
-          currentUserText: anchorSummary.text,
-          currentImageCount: anchorSummary.imageCount,
-          currentOtherAttachmentCount: anchorSummary.otherAttachmentCount,
-        });
-
-        if (deltaBudget.budgetBytes < MIN_DELTA_BUDGET_BYTES) {
-          const fullBudget = computeHandoffBudget({
-            tokenCap: input.tokenCap,
-            modelContextWindow: input.modelContextWindow,
-            nativeTokens: 0,
-            currentUserText: anchorSummary.text,
-            currentImageCount: anchorSummary.imageCount,
-            currentOtherAttachmentCount: anchorSummary.otherAttachmentCount,
-          });
-          newRecord = createHandoffRecord({
-            activeEntries,
-            coveredRuns: priorRuns,
-            strategy: "full_thread_summary",
-            fallbackReset: true,
-            targetLane: input.targetLane,
-            fromLane: lastDeliveredRun.ownerLane,
-            anchorUserEntryId: anchorRun.userEntryId,
-            budgetBytes: fullBudget.budgetBytes,
-            includeCompaction: true,
-          });
-        } else {
-          newRecord = createHandoffRecord({
-            activeEntries,
-            coveredRuns: deltaRuns,
-            strategy: "delta_since_target_last_seen",
-            fallbackReset: false,
-            targetLane: input.targetLane,
-            fromLane: lastDeliveredRun.ownerLane,
-            anchorUserEntryId: anchorRun.userEntryId,
-            budgetBytes: deltaBudget.budgetBytes,
-            includeCompaction: false,
-          });
-        }
-      } else {
-        const fullBudget = computeHandoffBudget({
-          tokenCap: input.tokenCap,
-          modelContextWindow: input.modelContextWindow,
-          nativeTokens: 0,
-          currentUserText: anchorSummary.text,
-          currentImageCount: anchorSummary.imageCount,
-          currentOtherAttachmentCount: anchorSummary.otherAttachmentCount,
-        });
-        newRecord = createHandoffRecord({
-          activeEntries,
-          coveredRuns: priorRuns,
-          strategy: "full_thread_summary",
-          fallbackReset: false,
-          targetLane: input.targetLane,
-          fromLane: lastDeliveredRun.ownerLane,
-          anchorUserEntryId: anchorRun.userEntryId,
-          budgetBytes: fullBudget.budgetBytes,
-          includeCompaction: true,
-        });
-      }
-
-      if (newRecord) {
-        workingFrozenRecords.set(anchorKey, newRecord);
-      }
-    }
-  }
-
-  const plan = computeKeepSetAndEffectiveRecords(
+  const { newRecord, fallbackResetNoRecord, plan } = planLaneHandoff({
+    activeEntries,
+    firstRunStart,
     runs,
-    anchorRun,
-    input.targetLane,
-    workingFrozenRecords,
-  );
+    priorRuns,
+    editsByTarget,
+    preRunInfo,
+    targetLane: input.targetLane,
+    modelContextWindow: input.modelContextWindow,
+    tokenCap: input.tokenCap,
+    frozenRecords,
+    anchorOrdinal: anchorRun.ordinal,
+    anchorUserEntryId: anchorRun.userEntryId,
+    anchorSummary,
+    estimatePrefixTokens: (prefixPlan, upToOrdinal) =>
+      estimateNativePrefixTokens(
+        runs,
+        aligned.preRunMessages,
+        aligned.slices,
+        aligned.runIndexByOrdinal,
+        prefixPlan.omittedOrdinals,
+        prefixPlan.recordByRunOrdinal,
+        upToOrdinal,
+        prefixPlan.omitPreRunMessages,
+      ),
+  });
 
   const projectedMessages: AgentMessage[] = [];
   const appliedRecords: FrozenHandoffRecord[] = [];
   let keptNativeRuns = 0;
   let hasContentModification = newRecord !== null;
 
-  if (plan.effectiveStartOrdinal === 1) {
+  if (!plan.omitPreRunMessages) {
     projectedMessages.push(...aligned.preRunMessages);
   } else if (aligned.preRunMessages.length > 0) {
     hasContentModification = true;
@@ -1026,13 +1461,213 @@ export function projectMessagesForLane(
 
   const sanitized = dropOrphanedToolResults(projectedMessages);
   const modified = hasContentModification || sanitized.dropped;
+  const finalMessages = modified ? sanitized.messages : input.eventMessages;
+  const projectedContextTokens = estimateMessagesTokens(finalMessages);
+  const remainingContextTokens =
+    contextWindow !== null
+      ? Math.max(0, contextWindow - projectedContextTokens)
+      : null;
+
+  if (newRecord) {
+    newRecord.projectedContextTokens = projectedContextTokens;
+    if (contextWindow !== null) {
+      newRecord.modelContextWindow = contextWindow;
+      newRecord.remainingContextTokens = remainingContextTokens!;
+    }
+  }
 
   return {
-    messages: modified ? sanitized.messages : input.eventMessages,
+    messages: finalMessages,
     modified,
     activeLane: input.targetLane,
     newRecord,
     appliedRecords,
+    keptNativeRuns,
+    totalRuns,
+    projectedContextTokens,
+    contextWindow,
+    remainingContextTokens,
+    ...(fallbackResetNoRecord ? { fallbackResetNoRecord: true } : {}),
+  };
+}
+
+/**
+ * Pure read-only preview of what `projectMessagesForLane` would do for
+ * `targetLane` on the given `branch`, without mutating inputs or persisting records.
+ */
+export function previewHandoffForLane(
+  input: HandoffPreviewInput,
+): HandoffPreview {
+  const activeEntries = sliceActiveBranchAfterCompaction(input.branch);
+  const runs = segmentBranchIntoRuns(activeEntries, input.targetLane);
+  const totalRuns = runs.length;
+  const editsByTarget = collectContextEditsByTarget(activeEntries);
+  const contextWindow = normalizeContextWindow(input.modelContextWindow);
+
+  const estimateUnmodifiedTokens = (): number => {
+    let total = 0;
+    for (const entry of activeEntries) {
+      total += estimateSessionEntryTokens(entry, editsByTarget);
+    }
+    return total;
+  };
+
+  if (input.bypass) {
+    const projectedContextTokens = estimateUnmodifiedTokens();
+    return {
+      targetLane: input.targetLane,
+      fromLane: null,
+      willHandoff: false,
+      strategy: null,
+      estimatedHandoffTokens: 0,
+      projectedContextTokens,
+      contextWindow,
+      remainingContextTokens:
+        contextWindow !== null
+          ? Math.max(0, contextWindow - projectedContextTokens)
+          : null,
+      coveredRunFrom: null,
+      coveredRunTo: null,
+      fallbackReset: false,
+      keptNativeRuns: totalRuns,
+      totalRuns,
+    };
+  }
+
+  const firstRunStart = runs[0]?.startIndex ?? activeEntries.length;
+  const preRunInfo = inspectPreRunContext(
+    activeEntries,
+    firstRunStart,
+    editsByTarget,
+  );
+  const frozenRecords = collectFrozenRecords(activeEntries, input.extraRecords);
+
+  if (totalRuns === 0 && (!preRunInfo.hasContext || preRunInfo.ownerLane === null || preRunInfo.ownerLane === input.targetLane)) {
+    const projectedContextTokens = estimateUnmodifiedTokens();
+    return {
+      targetLane: input.targetLane,
+      fromLane: null,
+      willHandoff: false,
+      strategy: null,
+      estimatedHandoffTokens: 0,
+      projectedContextTokens,
+      contextWindow,
+      remainingContextTokens:
+        contextWindow !== null
+          ? Math.max(0, contextWindow - projectedContextTokens)
+          : null,
+      coveredRunFrom: null,
+      coveredRunTo: null,
+      fallbackReset: false,
+      keptNativeRuns: 0,
+      totalRuns: 0,
+    };
+  }
+
+  const lastRun = totalRuns > 0 ? runs[totalRuns - 1] : null;
+  const lastRunIsPendingAnchor =
+    lastRun !== null &&
+    !lastRun.delivered &&
+    !lastRun.hasError &&
+    !runHasConversationOrToolActivity(lastRun, editsByTarget);
+
+  const priorRuns = lastRunIsPendingAnchor ? runs.slice(0, -1) : runs;
+  const anchorOrdinal = lastRunIsPendingAnchor
+    ? lastRun.ordinal
+    : totalRuns + 1;
+  const anchorUserEntryId = lastRunIsPendingAnchor
+    ? lastRun.userEntryId
+    : "__preview_next_turn__";
+
+  let anchorSummary = { text: "", imageCount: 0, otherAttachmentCount: 0 };
+  if (lastRunIsPendingAnchor && lastRun) {
+    const userEntry = activeEntries[lastRun.startIndex] as SessionMessageEntry & {
+      message: UserMessage;
+    };
+    const edit = editsByTarget.get(lastRun.userEntryId);
+    const effectiveContent =
+      edit?.replacement && typeof edit.replacement.content !== "undefined"
+        ? (edit.replacement.content as UserMessage["content"])
+        : userEntry.message?.content;
+    anchorSummary = extractUserContentSummary(effectiveContent);
+  }
+
+  const { newRecord, fallbackResetNoRecord, attemptedFromLane, plan } =
+    planLaneHandoff({
+      activeEntries,
+      firstRunStart,
+      runs,
+      priorRuns,
+      editsByTarget,
+      preRunInfo,
+      targetLane: input.targetLane,
+      modelContextWindow: input.modelContextWindow,
+      tokenCap: input.tokenCap,
+      frozenRecords,
+      anchorOrdinal,
+      anchorUserEntryId,
+      anchorSummary,
+      estimatePrefixTokens: (prefixPlan, upToOrdinal) =>
+        estimateNativePrefixTokensFromBranch(
+          runs,
+          preRunInfo.entries,
+          editsByTarget,
+          prefixPlan.omittedOrdinals,
+          prefixPlan.recordByRunOrdinal,
+          upToOrdinal,
+          prefixPlan.omitPreRunMessages,
+        ),
+    });
+
+  let projectedContextTokens = 0;
+  if (!plan.omitPreRunMessages) {
+    for (const entry of preRunInfo.entries) {
+      projectedContextTokens += estimateSessionEntryTokens(entry, editsByTarget);
+    }
+  }
+
+  let keptNativeRuns = 0;
+  for (const run of runs) {
+    if (plan.omittedOrdinals.has(run.ordinal)) {
+      continue;
+    }
+    keptNativeRuns += 1;
+    for (const entry of run.entries) {
+      projectedContextTokens += estimateSessionEntryTokens(entry, editsByTarget);
+    }
+    const rec = plan.recordByRunOrdinal.get(run.ordinal);
+    if (rec) {
+      projectedContextTokens += estimateTextTokens(rec.renderedText);
+    }
+  }
+
+  // When predicting a brand-new handoff for the upcoming turn (synthetic anchor),
+  // include the predicted capsule tokens in projectedContextTokens.
+  if (!lastRunIsPendingAnchor && newRecord) {
+    projectedContextTokens += estimateTextTokens(newRecord.renderedText);
+  }
+
+  const remainingContextTokens =
+    contextWindow !== null
+      ? Math.max(0, contextWindow - projectedContextTokens)
+      : null;
+
+  return {
+    targetLane: input.targetLane,
+    fromLane: newRecord
+      ? newRecord.fromLane
+      : fallbackResetNoRecord
+        ? attemptedFromLane
+        : null,
+    willHandoff: newRecord !== null,
+    strategy: newRecord ? newRecord.strategy : null,
+    estimatedHandoffTokens: newRecord ? newRecord.estimatedTokens : 0,
+    projectedContextTokens,
+    contextWindow,
+    remainingContextTokens,
+    coveredRunFrom: newRecord ? newRecord.coveredRunFrom : null,
+    coveredRunTo: newRecord ? newRecord.coveredRunTo : null,
+    fallbackReset: Boolean(newRecord?.fallbackReset || fallbackResetNoRecord),
     keptNativeRuns,
     totalRuns,
   };

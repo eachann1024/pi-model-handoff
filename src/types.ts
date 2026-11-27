@@ -3,12 +3,14 @@ import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 
 export const HANDOFF_ENTRY_TYPE = "pi-model-handoff:record";
 export const STATUS_KEY = "pi-model-handoff";
+export const WIDGET_KEY = "pi-model-handoff:banner";
 export const TOOL_NAME_HISTORY_READ = "thread_history_read";
 
 export const DEFAULT_HANDOFF_TOKEN_CAP = 16_000;
 export const MIN_HANDOFF_TOKEN_CAP = 1_024;
 export const MAX_HANDOFF_TOKEN_CAP = 64_000;
 export const HANDOFF_BYTE_CAP = 64_000;
+export const SYSTEM_OVERHEAD_RESERVE_TOKENS = 2_000;
 export const MAX_LISTED_OMITTED_ITEMS = 20;
 export const MIN_DELTA_BUDGET_BYTES = 512;
 export const THREAD_READ_RESULT_MAX_BYTES = 30_000;
@@ -70,6 +72,9 @@ export interface FrozenHandoffRecord {
   estimatedTokens: number;
   byteLength: number;
   renderedText: string;
+  modelContextWindow?: number;
+  projectedContextTokens?: number;
+  remainingContextTokens?: number;
   createdAt: number;
 }
 
@@ -127,6 +132,35 @@ export interface ProjectionResult {
   activeLane: LaneKey;
   newRecord: FrozenHandoffRecord | null;
   appliedRecords: FrozenHandoffRecord[];
+  keptNativeRuns: number;
+  totalRuns: number;
+  projectedContextTokens: number;
+  contextWindow: number | null;
+  remainingContextTokens: number | null;
+  fallbackResetNoRecord?: boolean;
+}
+
+export interface HandoffPreviewInput {
+  branch: SessionEntry[];
+  targetLane: LaneKey;
+  modelContextWindow?: number;
+  tokenCap: number;
+  extraRecords?: ReadonlyMap<string, FrozenHandoffRecord>;
+  bypass?: boolean;
+}
+
+export interface HandoffPreview {
+  targetLane: LaneKey;
+  fromLane: LaneKey | null;
+  willHandoff: boolean;
+  strategy: HandoffStrategy | null;
+  estimatedHandoffTokens: number;
+  projectedContextTokens: number;
+  contextWindow: number | null;
+  remainingContextTokens: number | null;
+  coveredRunFrom: number | null;
+  coveredRunTo: number | null;
+  fallbackReset: boolean;
   keptNativeRuns: number;
   totalRuns: number;
 }

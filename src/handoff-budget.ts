@@ -18,7 +18,6 @@ import {
   type BudgetResult,
   type ConversationRun,
   DEFAULT_HANDOFF_TOKEN_CAP,
-  HANDOFF_BYTE_CAP,
   HANDOFF_ENTRY_TYPE,
   type HistoricalItem,
   type LaneKey,
@@ -27,6 +26,7 @@ import {
   MIN_HANDOFF_TOKEN_CAP,
   type SelectAndRenderHandoffInput,
   type SelectionResult,
+  SYSTEM_OVERHEAD_RESERVE_TOKENS,
   TOOL_NAME_HISTORY_READ,
 } from "./types.ts";
 
@@ -118,6 +118,10 @@ export function computeHandoffBudget(input: BudgetInput): BudgetResult {
     Math.max(MIN_WORK_RESERVE_TOKENS, Math.ceil(windowTokens / 4)),
     Math.ceil(windowTokens / 2),
   );
+  const systemOverheadTokens = Math.min(
+    SYSTEM_OVERHEAD_RESERVE_TOKENS,
+    Math.floor(windowTokens * 0.1),
+  );
 
   const tokenCap =
     Number.isFinite(input.tokenCap) && input.tokenCap > 0
@@ -126,10 +130,15 @@ export function computeHandoffBudget(input: BudgetInput): BudgetResult {
 
   const availableTokens = Math.max(
     0,
-    windowTokens - nativeTokens - currentTokens - workReserveTokens,
+    windowTokens -
+      nativeTokens -
+      currentTokens -
+      workReserveTokens -
+      systemOverheadTokens,
   );
   const budgetTokens = Math.max(0, Math.min(tokenCap, availableTokens));
-  const budgetBytes = Math.min(budgetTokens * 4, HANDOFF_BYTE_CAP);
+  const maxBudgetBytes = Math.min(tokenCap * 4, MAX_HANDOFF_TOKEN_CAP * 4);
+  const budgetBytes = Math.min(budgetTokens * 4, maxBudgetBytes);
 
   return {
     budgetBytes,
@@ -607,34 +616,15 @@ export function extractHistoricalItems(
   preRunSummaries?: readonly SessionEntry[],
 ): HistoricalItem[] {
   const items: HistoricalItem[] = [];
-
-  if (Array.isArray(preRunSummaries)) {
-    const preOrdinal = Array.isArray(runs) && runs.length > 0 ? Math.max(0, runs[0].ordinal - 1) : 0;
-    for (const entry of preRunSummaries) {
-      if (!entry || typeof entry !== "object") {
-        continue;
-      }
-      if (entry.type === "message") {
-        appendMessageItems(entry, preOrdinal, new Map(), new Set(), items);
-      } else {
-        appendNonMessageEntry(entry, preOrdinal, items);
-      }
+  const toolResultsByCallId = new Map<
+    string,
+    { entry: SessionMessageEntry; msg: ToolResultMessage }
+  >();
+  const registerToolResults = (entries: readonly SessionEntry[] | undefined): void => {
+    if (!Array.isArray(entries)) {
+      return;
     }
-  }
-
-  if (!Array.isArray(runs)) {
-    return items;
-  }
-
-  for (const run of runs) {
-    if (!run || !Array.isArray(run.entries)) {
-      continue;
-    }
-    const toolResultsByCallId = new Map<
-      string,
-      { entry: SessionMessageEntry; msg: ToolResultMessage }
-    >();
-    for (const entry of run.entries) {
+    for (const entry of entries) {
       if (
         entry &&
         entry.type === "message" &&
@@ -650,8 +640,47 @@ export function extractHistoricalItems(
         }
       }
     }
+  };
 
-    const handledToolCallIds = new Set<string>();
+  registerToolResults(preRunSummaries);
+  if (Array.isArray(runs)) {
+    for (const run of runs) {
+      if (run && Array.isArray(run.entries)) {
+        registerToolResults(run.entries);
+      }
+    }
+  }
+
+  const handledToolCallIds = new Set<string>();
+
+  if (Array.isArray(preRunSummaries)) {
+    const preOrdinal = Array.isArray(runs) && runs.length > 0 ? Math.max(0, runs[0].ordinal - 1) : 0;
+    for (const entry of preRunSummaries) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+      if (entry.type === "message") {
+        appendMessageItems(
+          entry,
+          preOrdinal,
+          toolResultsByCallId,
+          handledToolCallIds,
+          items,
+        );
+      } else {
+        appendNonMessageEntry(entry, preOrdinal, items);
+      }
+    }
+  }
+
+  if (!Array.isArray(runs)) {
+    return items;
+  }
+
+  for (const run of runs) {
+    if (!run || !Array.isArray(run.entries)) {
+      continue;
+    }
     for (const entry of run.entries) {
       if (!entry || typeof entry !== "object") {
         continue;
@@ -855,7 +884,10 @@ export function selectAndRenderHandoff(
   const rawBudgetBytes = Number.isFinite(input.budgetBytes)
     ? Math.floor(input.budgetBytes)
     : 0;
-  const budgetBytes = Math.max(0, Math.min(HANDOFF_BYTE_CAP, rawBudgetBytes));
+  const budgetBytes = Math.max(
+    0,
+    Math.min(MAX_HANDOFF_TOKEN_CAP * 4, rawBudgetBytes),
+  );
   const orderedItems = [...input.items].sort((a, b) => a.position - b.position);
 
   if (budgetBytes === 0) {
