@@ -1,6 +1,6 @@
 {
   "name": "@each1024/pi-model-handoff",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Switch models mid-session in Pi with a bounded context handoff and on-demand access to conversation history.",
   "type": "module",
   "license": "MIT",
@@ -24,10 +24,12 @@
   ],
   "files": [
     "src",
+    "README.md",
     "LICENSE"
   ],
   "pi": {
     "changelogPath": "",
+    "image": "https://raw.githubusercontent.com/eachann1024/pi-model-handoff/main/assets/pi-model-handoff-cover.webp",
     "extensions": [
       "./src/index.ts"
     ]

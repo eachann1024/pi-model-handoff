@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="440" viewBox="0 0 1200 440" role="img" aria-labelledby="title desc">
+  <title id="title">Pi Model Handoff — 随时换模型。 上下文不断。</title>
+  <desc id="desc">按模型分轨、有预算的模型交接、按需回查对话全文与实时状态提示。</desc>
+  <rect width="1200" height="440" fill="#f8f7f3"/>
+  <g fill="#252923" font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif">
+    <text x="56" y="52" font-size="20" font-weight="600">Pi Model Handoff</text>
+    <text x="1144" y="52" text-anchor="end" font-size="12" letter-spacing="2" fill="#62675e">SWITCH MODELS WITHOUT LOSING THE THREAD</text>
+    <path d="M56 80H1144 M736 120V344 M56 384H1144" fill="none" stroke="#d5d7cb"/>
+    <g font-family="Georgia, Songti SC, STSong, serif" font-size="72" letter-spacing="-2">
+      <text x="56" y="200">随时换模型。</text>
+      <text x="56" y="288" fill="#3e6148">上下文不断。</text>
+    </g>
+    <text x="56" y="340" font-size="17" fill="#62675e">为 Pi 提供有预算的模型交接，随时切回，按需回查。</text>
+    <text x="776" y="136" fill="#3e6148" font-size="12" font-family="monospace">01</text>
+    <text x="816" y="136" font-size="20">轨道，各自独立。</text>
+    <text x="816" y="164" font-size="13" fill="#62675e">按模型分轨 · 冻结摘要 · 缓存稳定</text>
+    <text x="776" y="224" fill="#3e6148" font-size="12" font-family="monospace">02</text>
+    <text x="816" y="224" font-size="20">交接，预算可控。</text>
+    <text x="816" y="252" font-size="13" fill="#62675e">首次与增量摘要 · Token 上限保护</text>
+    <text x="776" y="312" fill="#3e6148" font-size="12" font-family="monospace">03</text>
+    <text x="816" y="312" font-size="20">历史，按需回查。</text>
+    <text x="816" y="340" font-size="13" fill="#62675e">分段读取全文 · 实时状态提示</text>
+    <text x="56" y="416" font-size="12" letter-spacing="1" fill="#62675e">PI MODEL HANDOFF / 切换模型，不断脉络</text>
+    <text x="1144" y="416" text-anchor="end" font-size="12" fill="#62675e">OPEN SOURCE · MIT</text>
+  </g>
+</svg>
