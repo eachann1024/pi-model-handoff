@@ -1,0 +1,53 @@
+{
+  "name": "@each1024/pi-model-handoff",
+  "version": "0.1.0",
+  "description": "Switch models mid-session in Pi with a bounded context handoff and on-demand access to conversation history.",
+  "type": "module",
+  "license": "MIT",
+  "author": "eachann1024",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/eachann1024/pi-model-handoff.git"
+  },
+  "homepage": "https://github.com/eachann1024/pi-model-handoff",
+  "bugs": {
+    "url": "https://github.com/eachann1024/pi-model-handoff/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-extension"
+  ],
+  "files": [
+    "src",
+    "LICENSE"
+  ],
+  "pi": {
+    "changelogPath": "",
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^1.6.1",
+    "@earendil-works/pi-coding-agent": "^1.6.1",
+    "@types/node": "^26.6.11",
+    "typebox": "^1.4.7",
+    "typescript": "^7.0.2"
+  }
+}
