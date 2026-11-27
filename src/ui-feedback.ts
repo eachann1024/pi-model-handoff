@@ -20,15 +20,15 @@ function formatStrategyLabel(
   fallbackReset: boolean,
 ): string {
   if (fallbackReset) {
-    return "保底";
+    return "保底摘要";
   }
   if (strategy === "delta_since_target_last_seen") {
-    return "增量";
+    return "增量摘要";
   }
   if (strategy === "full_thread_summary") {
-    return "全量";
+    return "首次摘要";
   }
-  return "交接";
+  return "摘要";
 }
 
 function formatLaneTransition(
@@ -66,11 +66,11 @@ function formatHandoffLine(
   const modePart = options.detailPrefix
     ? `${options.detailPrefix} · ${mode}`
     : mode;
-  const summaryLabel = options.summaryApproximate ? "摘要约" : "摘要";
-  const detail =
+  const tokenPart =
     options.summaryTokens !== null
-      ? `${modePart} · ${summaryLabel} ${formatTokenCount(options.summaryTokens)} tokens`
-      : `${modePart}模式`;
+      ? `${options.summaryApproximate ? "约 " : ""}${formatTokenCount(options.summaryTokens)} tokens`
+      : null;
+  const detail = tokenPart ? `${modePart} · ${tokenPart}` : modePart;
   const mainText = `${options.prefix} ${laneLabel}（${detail}）`;
   const remainingText = formatRemainingContext(
     options.remaining,
@@ -355,7 +355,7 @@ export function formatStatusCommandSummary(params: {
       params.pendingPreview.fallbackReset,
     );
     lines.push(
-      `待执行接管：${pendingModel}（${pendingMode} · 摘要约 ${formatTokenCount(params.pendingPreview.estimatedHandoffTokens)} tokens）`,
+      `待执行接管：${pendingModel}（${pendingMode} · 约 ${formatTokenCount(params.pendingPreview.estimatedHandoffTokens)} tokens）`,
     );
   }
 
@@ -366,7 +366,7 @@ export function formatStatusCommandSummary(params: {
       Boolean(params.latestRecord.fallbackReset),
     );
     lines.push(
-      `最近接管：${latestModel}（${latestMode} · 摘要 ${formatTokenCount(params.latestRecord.estimatedTokens)} tokens · 覆盖第 ${params.latestRecord.coveredRunFrom}-${params.latestRecord.coveredRunTo} 轮 · 纳入 ${params.latestRecord.includedCount} 条 / 省略 ${params.latestRecord.omittedCount} 条）`,
+      `最近接管：${latestModel}（${latestMode} · ${formatTokenCount(params.latestRecord.estimatedTokens)} tokens · 覆盖第 ${params.latestRecord.coveredRunFrom}-${params.latestRecord.coveredRunTo} 轮 · 纳入 ${params.latestRecord.includedCount} 条 / 省略 ${params.latestRecord.omittedCount} 条）`,
     );
   } else {
     lines.push("最近接管：暂无");
